@@ -1,0 +1,156 @@
+
+
+CREATE OR REPLACE TRIGGER prevent_direct_grants
+BEFORE GRANT ON DATABASE
+DECLARE
+    v_username VARCHAR2(30);
+    v_privilege VARCHAR2(40);
+BEGIN
+    -- Get current user and privilege being granted
+    v_username := SYS_CONTEXT('USERENV', 'SESSION_USER');
+    v_privilege := ORA_DICT_OBJ_NAME;
+    
+    -- Check if grant is being made directly to a user (not role)
+    IF ORA_DICT_OBJ_TYPE = 'USER' THEN
+        -- List of restricted privileges
+        IF UPPER(v_privilege) IN ('DBA', 'SYSDBA', 'SYSOPER', 'UNLIMITED TABLESPACE') THEN
+            RAISE_APPLICATION_ERROR(-20001, 
+                'Direct grants of ' || v_privilege || ' to users are not allowed. Use roles instead.');
+        END IF;
+    END IF;
+END;
+/
+
+
+
+-- Create FGA policy to monitor privilege grants
+BEGIN
+    DBMS_FGA.ADD_POLICY(
+        object_schema      => 'SYS',
+        object_name        => 'SYSAUTH$',
+        policy_name        => 'MONITOR_DIRECT_GRANTS',
+        audit_condition    => '1=1',
+        audit_column       => NULL,
+        handler_schema     => 'SECURITY_ADMIN',
+        handler_module     => 'ALERT_ON_DIRECT_GRANT',
+        enable             => TRUE
+    );
+END;
+/
+
+-- Create alert handler procedure
+CREATE OR REPLACE PROCEDURE alert_on_direct_grant(
+    object_schema VARCHAR2,
+    object_name VARCHAR2,
+    policy_name VARCHAR2
+)
+AS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    v_sql_text VARCHAR2(4000);
+BEGIN
+    -- Get the SQL text that triggered the audit
+    SELECT sql_text INTO v_sql_text
+    FROM dba_fga_audit_trail
+    WHERE session_id = SYS_CONTEXT('USERENV', 'SESSIONID')
+    AND timestamp = (SELECT MAX(timestamp) 
+                     FROM dba_fga_audit_trail 
+                     WHERE session_id = SYS_CONTEXT('USERENV', 'SESSIONID'));
+    
+    -- Check if it's a direct grant to user
+    IF UPPER(v_sql_text) LIKE 'GRANT%TO %' AND UPPER(v_sql_text) NOT LIKE '%TO ROLE%' THEN
+        -- Log the violation
+        INSERT INTO security_violations_log 
+        VALUES (SYS_CONTEXT('USERENV', 'SESSION_USER'), v_sql_text, SYSTIMESTAMP);
+        
+        -- Optionally send email alert
+        -- UTL_MAIL.send(...);
+        
+        COMMIT;
+    END IF;
+END;
+/
+
+CREATE OR REPLACE TRIGGER prevent_privilege_use
+BEFORE SERVERERROR ON DATABASE
+DECLARE
+    v_sql_text ORA_NAME_LIST_T;
+    v_sql_stmt VARCHAR2(4000);
+    v_count NUMBER;
+BEGIN
+    -- Get the SQL text that caused error
+    FOR i IN 1..ORA_SQL_TXT(v_sql_text) LOOP
+        v_sql_stmt := v_sql_stmt || v_sql_text(i);
+    END LOOP;
+    
+    -- Check if it's a GRANT statement to user
+    IF UPPER(v_sql_stmt) LIKE 'GRANT%TO %' AND UPPER(v_sql_stmt) NOT LIKE '%TO ROLE%' THEN
+        -- Check for restricted privileges
+        IF REGEXP_LIKE(UPPER(v_sql_stmt), 'GRANT\s+(.*?)\s+TO', 'i') THEN
+            RAISE_APPLICATION_ERROR(-20002, 
+                'Direct privilege grants to users are prohibited. Please use roles.');
+        END IF;
+    END IF;
+END;
+/
+
+
+
+-- Create violation logging table
+CREATE TABLE security_policy_violations (
+    violation_id NUMBER GENERATED ALWAYS AS IDENTITY,
+    username VARCHAR2(30),
+    sql_text VARCHAR2(4000),
+    violation_type VARCHAR2(100),
+    timestamp TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+-- Main prevention procedure
+CREATE OR REPLACE PACKAGE privilege_policy AS
+    PROCEDURE check_grant_privileges;
+    FUNCTION is_restricted_privilege(p_privilege VARCHAR2) RETURN BOOLEAN;
+END privilege_policy;
+/
+
+CREATE OR REPLACE PACKAGE BODY privilege_policy AS
+    
+    FUNCTION is_restricted_privilege(p_privilege VARCHAR2) RETURN BOOLEAN IS
+        restricted_privileges SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST(
+            'DBA', 'SYSDBA', 'SYSOPER', 'UNLIMITED TABLESPACE',
+            'ALTER DATABASE', 'ALTER SYSTEM', 'AUDIT SYSTEM'
+        );
+    BEGIN
+        RETURN (UPPER(p_privilege) MEMBER OF restricted_privileges);
+    END;
+    
+    PROCEDURE check_grant_privileges IS
+        v_sql_text VARCHAR2(4000);
+        v_grantee VARCHAR2(30);
+        v_privilege VARCHAR2(100);
+    BEGIN
+        -- Get current SQL
+        SELECT sql_fulltext INTO v_sql_text
+        FROM v$sql
+        WHERE sql_id = (SELECT prev_sql_id FROM v$session WHERE audsid = SYS_CONTEXT('USERENV', 'SESSIONID'));
+        
+        -- Parse GRANT statement (simplified)
+        IF REGEXP_LIKE(UPPER(v_sql_text), '^GRANT\s+([^ ]+)\s+TO\s+([^ ]+)$', 'i') THEN
+            v_privilege := REGEXP_SUBSTR(v_sql_text, 'GRANT\s+([^ ]+)\s+TO', 1, 1, 'i', 1);
+            v_grantee := REGEXP_SUBSTR(v_sql_text, 'TO\s+([^ ]+)$', 1, 1, 'i', 1);
+            
+            -- Check if grantee is a user (not role) and privilege is restricted
+            IF is_restricted_privilege(v_privilege) THEN
+                -- Log violation
+                INSERT INTO security_policy_violations (username, sql_text, violation_type)
+                VALUES (SYS_CONTEXT('USERENV', 'SESSION_USER'), v_sql_text, 'DIRECT_PRIVILEGE_GRANT');
+                
+                RAISE_APPLICATION_ERROR(-20003, 
+                    'Direct grant of ' || v_privilege || ' to user ' || v_grantee || 
+                    ' is not allowed. Use roles for privilege assignment.');
+            END IF;
+        END IF;
+    END check_grant_privileges;
+END privilege_policy;
+/
+
+-- Enable the policy
+ALTER SYSTEM SET SEC_CASE_SENSITIVE_LOGON = FALSE;
