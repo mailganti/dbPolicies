@@ -1,0 +1,258 @@
+-- Create table to store excluded users
+CREATE TABLE privilege_policy_exclusions (
+    username VARCHAR2(30) PRIMARY KEY,
+    reason VARCHAR2(200),
+    excluded_by VARCHAR2(30) DEFAULT USER,
+    excluded_date DATE DEFAULT SYSDATE
+);
+
+-- Insert some excluded users
+INSERT INTO privilege_policy_exclusions (username, reason) VALUES ('SYS', 'System Administrator');
+INSERT INTO privilege_policy_exclusions (username, reason) VALUES ('SYSTEM', 'System Administrator');
+INSERT INTO privilege_policy_exclusions (username, reason) VALUES ('SECURITY_ADMIN', 'Security Team');
+INSERT INTO privilege_policy_exclusions (username, reason) VALUES ('AUDIT_ADMIN', 'Audit Team');
+COMMIT;
+
+#############  Updated Database Trigger with Exclusions
+
+
+CREATE OR REPLACE TRIGGER prevent_direct_grants
+BEFORE GRANT ON DATABASE
+DECLARE
+    v_grantor VARCHAR2(30);
+    v_grantee VARCHAR2(30);
+    v_privilege VARCHAR2(40);
+    v_is_excluded NUMBER;
+BEGIN
+    v_grantor := SYS_CONTEXT('USERENV', 'SESSION_USER');
+    v_privilege := ORA_DICT_OBJ_NAME;
+    
+    -- Get grantee from the statement (simplified parsing)
+    FOR i IN 1..ORA_SQL_TXT(v_sql_pieces) LOOP
+        -- Basic parsing to extract grantee
+        NULL; -- In practice, you'd parse the SQL text
+    END LOOP;
+    
+    -- Check if current grantor is in exclusion list
+    SELECT COUNT(*) INTO v_is_excluded
+    FROM privilege_policy_exclusions
+    WHERE username = v_grantor;
+    
+    -- If grantor is not excluded, apply the policy
+    IF v_is_excluded = 0 THEN
+        IF ORA_DICT_OBJ_TYPE = 'USER' THEN
+            -- List of restricted privileges
+            IF UPPER(v_privilege) IN ('DBA', 'SYSDBA', 'SYSOPER', 'UNLIMITED TABLESPACE') THEN
+                RAISE_APPLICATION_ERROR(-20001, 
+                    'Direct grants of ' || v_privilege || ' to users are not allowed. Use roles instead.');
+            END IF;
+        END IF;
+    END IF;
+END;
+/
+
+
+####################### Enhanced FGA Policy with Exclusions
+
+
+-- Improved FGA policy that checks exclusions
+BEGIN
+    DBMS_FGA.DROP_POLICY('SYS', 'SYSAUTH$', 'MONITOR_DIRECT_GRANTS');
+END;
+/
+
+BEGIN
+    DBMS_FGA.ADD_POLICY(
+        object_schema      => 'SYS',
+        object_name        => 'SYSAUTH$',
+        policy_name        => 'MONITOR_DIRECT_GRANTS',
+        audit_condition    => 'NOT EXISTS (SELECT 1 FROM privilege_policy_exclusions 
+                                          WHERE username = SYS_CONTEXT(''USERENV'', ''SESSION_USER''))',
+        audit_column       => NULL,
+        handler_schema     => 'SECURITY_ADMIN',
+        handler_module     => 'ALERT_ON_DIRECT_GRANT',
+        enable             => TRUE
+    );
+END;
+/
+
+################ Comprehensive Policy Package with Exclusions
+
+CREATE OR REPLACE PACKAGE privilege_policy AS
+    PROCEDURE check_grant_privileges;
+    FUNCTION is_restricted_privilege(p_privilege VARCHAR2) RETURN BOOLEAN;
+    FUNCTION is_excluded_user RETURN BOOLEAN;
+    FUNCTION get_grantee_from_sql(p_sql_text VARCHAR2) RETURN VARCHAR2;
+END privilege_policy;
+/
+
+CREATE OR REPLACE PACKAGE BODY privilege_policy AS
+    
+    FUNCTION is_excluded_user RETURN BOOLEAN IS
+        v_count NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO v_count
+        FROM privilege_policy_exclusions
+        WHERE username = SYS_CONTEXT('USERENV', 'SESSION_USER');
+        
+        RETURN (v_count > 0);
+    END;
+    
+    FUNCTION is_restricted_privilege(p_privilege VARCHAR2) RETURN BOOLEAN IS
+        restricted_privileges SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST(
+            'DBA', 'SYSDBA', 'SYSOPER', 'UNLIMITED TABLESPACE',
+            'ALTER DATABASE', 'ALTER SYSTEM', 'AUDIT SYSTEM',
+            'CREATE USER', 'DROP USER', 'ALTER USER'
+        );
+    BEGIN
+        RETURN (UPPER(p_privilege) MEMBER OF restricted_privileges);
+    END;
+    
+    FUNCTION get_grantee_from_sql(p_sql_text VARCHAR2) RETURN VARCHAR2 IS
+        v_grantee VARCHAR2(100);
+    BEGIN
+        -- Simple regex to extract grantee (for demonstration)
+        BEGIN
+            v_grantee := UPPER(REGEXP_SUBSTR(p_sql_text, 'TO\s+(\w+)', 1, 1, 'i', 1));
+            RETURN v_grantee;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RETURN NULL;
+        END;
+    END;
+    
+    PROCEDURE check_grant_privileges IS
+        v_sql_text VARCHAR2(4000);
+        v_grantee VARCHAR2(30);
+        v_privilege VARCHAR2(100);
+        v_is_grantee_excluded NUMBER;
+    BEGIN
+        -- Skip if current user is excluded
+        IF is_excluded_user THEN
+            RETURN;
+        END IF;
+        
+        -- Get current SQL
+        BEGIN
+            SELECT sql_fulltext INTO v_sql_text
+            FROM v$sql
+            WHERE sql_id = (SELECT prev_sql_id FROM v$session 
+                           WHERE audsid = SYS_CONTEXT('USERENV', 'SESSIONID'))
+            AND ROWNUM = 1;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RETURN;
+        END;
+        
+        -- Check if it's a GRANT statement
+        IF UPPER(v_sql_text) LIKE 'GRANT%TO%' THEN
+            v_privilege := REGEXP_SUBSTR(v_sql_text, 'GRANT\s+([^ ]+)\s+TO', 1, 1, 'i', 1);
+            v_grantee := get_grantee_from_sql(v_sql_text);
+            
+            -- Check if grantee is also excluded
+            IF v_grantee IS NOT NULL THEN
+                SELECT COUNT(*) INTO v_is_grantee_excluded
+                FROM privilege_policy_exclusions
+                WHERE username = v_grantee;
+                
+                -- Apply policy only if grantee is not excluded
+                IF v_is_grantee_excluded = 0 AND is_restricted_privilege(v_privilege) THEN
+                    -- Log violation
+                    INSERT INTO security_policy_violations (username, sql_text, violation_type)
+                    VALUES (SYS_CONTEXT('USERENV', 'SESSION_USER'), v_sql_text, 'DIRECT_PRIVILEGE_GRANT');
+                    
+                    RAISE_APPLICATION_ERROR(-20003, 
+                        'Direct grant of ' || v_privilege || ' to user ' || v_grantee || 
+                        ' is not allowed. Use roles for privilege assignment.');
+                END IF;
+            END IF;
+        END IF;
+    END check_grant_privileges;
+END privilege_policy;
+/
+
+ #### Management Procedures for Exclusion Table
+
+-- Procedure to add users to exclusion list
+CREATE OR REPLACE PROCEDURE add_policy_exclusion(
+    p_username IN VARCHAR2,
+    p_reason IN VARCHAR2 DEFAULT NULL
+) AS
+BEGIN
+    INSERT INTO privilege_policy_exclusions (username, reason)
+    VALUES (UPPER(p_username), p_reason);
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('User ' || p_username || ' added to exclusion list.');
+EXCEPTION
+    WHEN DUP_VAL_ON_INDEX THEN
+        DBMS_OUTPUT.PUT_LINE('User ' || p_username || ' is already excluded.');
+END;
+/
+
+-- Procedure to remove users from exclusion list
+CREATE OR REPLACE PROCEDURE remove_policy_exclusion(
+    p_username IN VARCHAR2
+) AS
+BEGIN
+    DELETE FROM privilege_policy_exclusions 
+    WHERE username = UPPER(p_username);
+    
+    IF SQL%ROWCOUNT = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('User ' || p_username || ' was not in exclusion list.');
+    ELSE
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('User ' || p_username || ' removed from exclusion list.');
+    END IF;
+END;
+/
+
+-- View current exclusions
+CREATE OR REPLACE VIEW policy_exclusions_view AS
+SELECT username, reason, excluded_by, excluded_date
+FROM privilege_policy_exclusions
+ORDER BY excluded_date;
+
+
+####  Usage Examples 
+
+-- Add users to exclusion list
+EXEC add_policy_exclusion('APP_ADMIN', 'Application Administrator');
+EXEC add_policy_exclusion('BACKUP_ADMIN', 'Backup Operations');
+
+-- Remove from exclusion list
+EXEC remove_policy_exclusion('AUDIT_ADMIN');
+
+-- View current exclusions
+SELECT * FROM policy_exclusions_view;
+
+-- Test the policy
+GRANT DBA TO TEST_USER; -- This will be blocked for non-excluded users
+
+-- As excluded user (this will work for users in exclusion table)
+-- Connect as SYS, SYSTEM, SECURITY_ADMIN, etc.
+
+###########Enhanced Monitoring Query with Exclusions
+
+-- Monitor direct grants excluding privileged users
+SELECT 
+    grantee,
+    granted_role,
+    admin_option,
+    default_role
+FROM dba_role_privs 
+WHERE grantee NOT IN (SELECT username FROM privilege_policy_exclusions)
+AND grantee NOT LIKE 'APEX%'
+AND granted_role IN ('DBA', 'RESOURCE', 'CONNECT');
+
+-- Monitor system privileges excluding privileged users
+SELECT 
+    grantee,
+    privilege,
+    admin_option
+FROM dba_sys_privs 
+WHERE grantee NOT IN (SELECT username FROM privilege_policy_exclusions)
+AND grantee NOT LIKE 'APEX%';
+
+
+
+ 
