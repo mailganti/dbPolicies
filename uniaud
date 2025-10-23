@@ -1,0 +1,1 @@
+    case $(ar t ${ORACLE_HOME}/rdbms/lib/libknlopt.a | grep 'kza.ang.o') in ("kzaiang.o") R="enabled" ;; "kzanang.o") R="disabled" ;; *) R="unknown" ;; esac && echo "Unified audit => $R"
