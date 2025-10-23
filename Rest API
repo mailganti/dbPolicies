@@ -1,0 +1,242 @@
+ALLOWED_EXTENSIONS = {'.sh', '.py', '.bash'}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_COMMANDS = ['echo', 'ls', 'cp', 'mv']  # Whitelist approach
+
+def validate_script_content(content):
+    # Check for dangerous commands
+    dangerous_patterns = [
+        'rm -rf /', 'mkfs', 'dd if=/dev/zero',
+        'chmod 777', 'passwd', 'visudo'
+    ]
+    for pattern in dangerous_patterns:
+        if pattern in content:
+            raise ValidationError(f"Dangerous command detected: {pattern}")
+
+
+
+import docker
+import tempfile
+import os
+
+def execute_in_sandbox(script_content, parameters, timeout):
+    client = docker.from_env()
+    
+    # Create temporary directory for execution
+    with tempfile.TemporaryDirectory() as temp_dir:
+        script_path = os.path.join(temp_dir, 'script.sh')
+        
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        os.chmod(script_path, 0o755)
+        
+        # Run in isolated container
+        container = client.containers.run(
+            'alpine:latest',
+            f'/app/script.sh',
+            volumes={temp_dir: {'bind': '/app', 'mode': 'ro'}},
+            working_dir='/app',
+            mem_limit='100m',
+            cpu_period=100000,
+            cpu_quota=50000,
+            network_mode='none',
+            detach=True
+        )
+        
+        try:
+            result = container.wait(timeout=timeout)
+            logs = container.logs().decode('utf-8')
+            return {
+                'exit_code': result['StatusCode'],
+                'output': logs,
+                'error': container.logs(stderr=True).decode('utf-8')
+            }
+        finally:
+            container.remove(force=True)
+
+
+
+
+CREATE TABLE scripts (
+    id VARCHAR(50) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    filename VARCHAR(255),
+    content TEXT,
+    language VARCHAR(50) DEFAULT 'bash',
+    timeout INTEGER DEFAULT 300,
+    created_by VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE script_executions (
+    id VARCHAR(50) PRIMARY KEY,
+    script_id VARCHAR(50) REFERENCES scripts(id),
+    status VARCHAR(50) DEFAULT 'queued',
+    exit_code INTEGER,
+    output TEXT,
+    error_output TEXT,
+    parameters JSON,
+    environment JSON,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    created_by VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE execution_logs (
+    id SERIAL PRIMARY KEY,
+    execution_id VARCHAR(50) REFERENCES script_executions(id),
+    log_level VARCHAR(20),
+    message TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["100 per hour", "10 per minute"]
+)
+
+# Apply different limits to different endpoints
+@app.route('/execute', methods=['POST'])
+@limiter.limit("5 per minute")
+def execute_script():
+    # Execution logic
+    pass
+
+
+
+from flask import Flask, request, jsonify
+import subprocess
+import tempfile
+import os
+import uuid
+import threading
+from datetime import datetime
+
+app = Flask(__name__)
+
+# In-memory storage (use database in production)
+scripts_db = {}
+executions_db = {}
+
+@app.route('/v1/scripts', methods=['POST'])
+def upload_script():
+    script_file = request.files['file']
+    script_id = str(uuid.uuid4())
+    
+    # Security validation
+    if not script_file.filename.endswith(('.sh', '.py')):
+        return jsonify({'error': 'Invalid file type'}), 400
+    
+    script_content = script_file.read().decode('utf-8')
+    
+    # Store script
+    scripts_db[script_id] = {
+        'id': script_id,
+        'name': request.form.get('name', script_file.filename),
+        'content': script_content,
+        'created_at': datetime.utcnow(),
+        'timeout': int(request.form.get('timeout', 300))
+    }
+    
+    return jsonify({'id': script_id, 'status': 'uploaded'})
+
+@app.route('/v1/scripts/<script_id>/execute', methods=['POST'])
+def execute_script(script_id):
+    if script_id not in scripts_db:
+        return jsonify({'error': 'Script not found'}), 404
+    
+    execution_id = str(uuid.uuid4())
+    parameters = request.json.get('parameters', {})
+    
+    # Store execution record
+    executions_db[execution_id] = {
+        'id': execution_id,
+        'script_id': script_id,
+        'status': 'running',
+        'parameters': parameters,
+        'started_at': datetime.utcnow()
+    }
+    
+    # Execute in background thread
+    thread = threading.Thread(
+        target=run_script,
+        args=(script_id, execution_id, parameters)
+    )
+    thread.start()
+    
+    return jsonify({
+        'execution_id': execution_id,
+        'status': 'started'
+    })
+
+def run_script(script_id, execution_id, parameters):
+    script = scripts_db[script_id]
+    
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(script['content'])
+            f.flush()
+            os.chmod(f.name, 0o755)
+            
+            # Prepare environment
+            env = os.environ.copy()
+            for key, value in parameters.items():
+                env[f"PARAM_{key.upper()}"] = str(value)
+            
+            # Execute script
+            result = subprocess.run(
+                [f.name],
+                capture_output=True,
+                text=True,
+                timeout=script['timeout'],
+                env=env
+            )
+            
+            # Update execution record
+            executions_db[execution_id].update({
+                'status': 'completed',
+                'exit_code': result.returncode,
+                'output': result.stdout,
+                'error_output': result.stderr,
+                'completed_at': datetime.utcnow()
+            })
+            
+    except subprocess.TimeoutExpired:
+        executions_db[execution_id].update({
+            'status': 'timeout',
+            'completed_at': datetime.utcnow()
+        })
+    except Exception as e:
+        executions_db[execution_id].update({
+            'status': 'failed',
+            'error_output': str(e),
+            'completed_at': datetime.utcnow()
+        })
+    finally:
+        # Cleanup
+        if 'f' in locals():
+            os.unlink(f.name)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+# Upload script
+curl -X POST -F "file=@backup.sh" -F "name=backup" \
+  -H "X-API-Key: your-key" https://api.scripts.example.com/v1/scripts
+
+# Execute script
+curl -X POST -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"parameters": {"path": "/home/user"}}' \
+  https://api.scripts.example.com/v1/scripts/script_123/execute
+
