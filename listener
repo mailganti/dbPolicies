@@ -1,8 +1,139 @@
+# listener.ora for RAC Node 1
+LISTENER_NODE1 =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node1-scan)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node1-vip)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node1)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+# Static registration for instances on this node
+SID_LIST_LISTENER_NODE1 =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = orcl)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = orcl1)
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = orcl_DGMGRL)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = orcl1)
+    )
+  )
+
+# For database in NOMOUNT mode (solves ORA-12528)
+SID_LIST_LISTENER_NODE1 =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = orcl)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = orcl1)
+    )
+    (SID_DESC =
+      (SID_NAME = orcl1)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (GLOBAL_DBNAME = orcl)
+      (PRESPAWN_MAX = 20)
+      (PRESPAWN_LIST =
+        (PRESPAWN_DESC =
+          (PROTOCOL = TCP)
+          (POOL_SIZE = 5)
+          (TIMEOUT = 1)
+        )
+      )
+    )
+  )
+
+ADR_BASE_LISTENER_NODE1 = /u01/app/oracle
+
+
+
+
+
+# listener.ora for RAC Node 2
+LISTENER_NODE2 =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node2-scan)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node2-vip)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = node2)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+SID_LIST_LISTENER_NODE2 =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = orcl)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = orcl2)
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = orcl_DGMGRL)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = orcl2)
+    )
+  )
+
+ADR_BASE_LISTENER_NODE2 = /u01/app/oracle
+
+
+
+
+
+# listener.ora for Auxiliary Node (for RMAN duplicate)
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = aux_host)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = aux_host-vip)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+# CRITICAL: Static registration for auxiliary instance in NOMOUNT
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
-      (GLOBAL_DBNAME = auxiliary_db)
+      (GLOBAL_DBNAME = auxdb)
       (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
-      (SID_NAME = aux_sid)
+      (SID_NAME = auxdb)
+    )
+    (SID_DESC =
+      (SID_NAME = auxdb)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (GLOBAL_DBNAME = auxdb)
+      (PRESPAWN_MAX = 20)
+    )
+    # For ASM if applicable
+    (SID_DESC =
+      (GLOBAL_DBNAME = +ASM)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+      (SID_NAME = +ASM1)
+    )
+  )
+
+# Listener parameters
+DEFAULT_SERVICE_LISTENER = auxdb
+INBOUND_CONNECT_TIMEOUT_LISTENER = 120
+ADR_BASE_LISTENER = /u01/app/oracle
+
+
+
+
+# Minimal listener.ora for quick setup
+LISTENER =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = localhost)(PORT = 1521))
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (SID_NAME = orcl)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
     )
   )
